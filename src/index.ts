@@ -1,88 +1,71 @@
+import Swagger from "swagger-client";
+import { z } from "zod";
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
+import openApiSpec from "./v1.json";
 
-// Define our MCP agent with tools
 export class MyMCP extends McpAgent {
   server = new McpServer({
-    name: "Integrations",
+    name: "Dynamic OpenAPI Proxy",
     version: "1.0.0",
   });
 
   async init() {
-    const baseUrl = "http://localhost:9998";
-    const organizationId = "<your-organization-id>";
-    const integrationId = "<your-integration-id>";
+    const spec = openApiSpec; // Use the imported JSON directly
 
-    // GET /time-check/current-utc → text/plain
-    this.server.tool("getCurrentUtc", {}, async () => {
-      const res = await fetch(`${baseUrl}/time-check/current-utc`, {
-        headers: {
-          "X-Org-Id": organizationId,
-        },
-      });
-      const text = await res.text();
-      return {
-        content: [{ type: "text", text }],
-      };
+    // 2) build a swagger-client to make invocation easy
+    const client = await Swagger({
+      spec,
     });
 
-    // GET /time-check/current-time/{city} → text/plain
-    this.server.tool(
-      "getTimeByCity",
-      { city: z.string() },
-      async ({ city }) => {
-        const res = await fetch(
-          `${baseUrl}/time-check/current-time/${encodeURIComponent(city)}`,
-          {
-            headers: {
-              "X-Org-Id": organizationId,
-            },
-          }
-        );
-        const text = await res.text();
-        return {
-          content: [{ type: "text", text }],
+    // 3) iterate operations
+    for (const tagName of Object.keys(client.apis)) {
+      const tag = (client.apis as any)[tagName];
+      for (const opId of Object.keys(tag)) {
+        const operation = (tag as any)[opId] as {
+          operationId?: string;
+          parameters?: any[];
+          requestBody?: any;
         };
-      }
-    );
 
-    // Calculator tool with multiple operations
-    this.server.tool(
-      "calculate",
-      {
-        operation: z.enum(["add", "subtract", "multiply", "divide"]),
-        a: z.number(),
-        b: z.number(),
-      },
-      async ({ operation, a, b }) => {
-        let result: number;
-        switch (operation) {
-          case "add":
-            result = a + b;
-            break;
-          case "subtract":
-            result = a - b;
-            break;
-          case "multiply":
-            result = a * b;
-            break;
-          case "divide":
-            if (b === 0)
-              return {
-                content: [
-                  {
-                    type: "text",
-                    text: "Error: Cannot divide by zero",
-                  },
-                ],
-              };
-            result = a / b;
-            break;
+        // derive a unique tool name and sanitize it
+        let toolName = operation.operationId || `${tagName}_${opId}`;
+        // Ensure name matches the pattern ^[a-zA-Z0-9_-]{1,64}$
+        toolName = toolName
+          .replace(/[^a-zA-Z0-9_-]/g, "_") // Replace invalid chars with underscore
+          .substring(0, 64); // Limit to 64 chars
+
+        // construct a Zod schema for inputs
+        const paramSchemas: Record<string, z.ZodTypeAny> = {};
+        (operation.parameters || []).forEach((p: any) => {
+          let schema: z.ZodTypeAny = z.any();
+          if (p.schema?.type === "string") schema = z.string();
+          if (p.schema?.type === "number") schema = z.number();
+          if (p.schema?.type === "boolean") schema = z.boolean();
+          paramSchemas[p.name] = schema;
+        });
+        if (operation.requestBody?.content?.["application/json"]?.schema) {
+          // simple handling of JSON bodies
+          paramSchemas["body"] = z.any();
         }
-        return { content: [{ type: "text", text: String(result) }] };
+
+        // register the tool
+        this.server.tool(toolName, paramSchemas, async (args, extra) => {
+          // 4a) call through swagger-client
+          const res = await (client.apis as any)[tagName][opId]({
+            ...args,
+            requestBody: args.body,
+          });
+          // 4b) normalize the response
+          const contentType = res.headers["content-type"] || "";
+          const isJson = contentType.includes("application/json");
+          const payload = isJson ? JSON.stringify(res.body) : res.text;
+          return {
+            content: [{ type: "text", text: payload }],
+          };
+        });
       }
-    );
+    }
   }
 }
 
