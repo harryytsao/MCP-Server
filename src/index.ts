@@ -1,7 +1,7 @@
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import openApiSchema from "./v2.json";
+import openApiSchema from "./v3.json";
 
 // Helper type for OpenAPI path parameters
 type PathParameter = {
@@ -21,6 +21,7 @@ type OpenAPIPropertySchema = {
   $ref?: string;
   default?: any;
   nullable?: boolean;
+  enum?: string[];
 };
 
 // Helper type for OpenAPI schema objects
@@ -30,6 +31,7 @@ type OpenAPISchemaObject = {
   properties?: {
     [key: string]: OpenAPIPropertySchema;
   };
+  enum?: string[];
 };
 
 // Helper type for OpenAPI components
@@ -48,6 +50,53 @@ function getZodSchemaForParameter(param: PathParameter): z.ZodTypeAny {
     schema = z.number();
   }
   return param.required ? schema : schema.optional();
+}
+
+// Helper to resolve schema references and create Zod schemas
+function resolveSchemaRef(
+  ref: string | undefined,
+  prop: OpenAPIPropertySchema,
+  schemas: OpenAPIComponents["schemas"]
+): z.ZodTypeAny {
+  if (ref) {
+    const refPath = ref.split("/").slice(1);
+    const schemaName = refPath[refPath.length - 1];
+    const referencedSchema = schemas[schemaName];
+
+    if (referencedSchema.enum) {
+      return z.enum(referencedSchema.enum as [string, ...string[]]);
+    }
+  }
+
+  if (prop.enum) {
+    return z.enum(prop.enum as [string, ...string[]]);
+  }
+
+  if (prop.type === "integer") {
+    return z.number().int();
+  } else if (prop.type === "string") {
+    if (prop.format === "uuid") {
+      // accept either a real UUID *or* the placeholder string
+      return z.union([z.string().uuid(), z.literal("{{$guid}}")]);
+    } else if (prop.format === "date-time" || prop.format === "datetime") {
+      // accept either a real ISO-8601 datetime *or* the placeholder
+      return z.union([
+        z.string().datetime({ offset: true }),
+        z.literal("{{$datetime iso8601}}"),
+      ]);
+    } else if (prop.format === "date") {
+      return z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+    } else if (prop.format === "time") {
+      return z.string().regex(/^\d{2}:\d{2}:\d{2}$/);
+    }
+    return z.string();
+  } else if (prop.type === "number") {
+    return z.number();
+  } else if (prop.type === "boolean") {
+    return z.boolean();
+  }
+
+  return z.string();
 }
 
 // Define our MCP agent with tools
@@ -92,22 +141,14 @@ export class MyMCP extends McpAgent {
       const schemaName = refPath[refPath.length - 1];
       const referencedSchema = schemas[schemaName];
 
-      // For GetClientRecord specifically
-      if (referencedSchema.required?.includes("ClientNumber")) {
-        paramSchema.ClientNumber = z.number().int();
-      }
-
-      // Add other required fields from the schema if needed
-      if (referencedSchema.required && referencedSchema.properties) {
-        referencedSchema.required.forEach((field: string) => {
-          const prop = referencedSchema.properties?.[field];
-          if (prop?.type) {
-            if (prop.type === "integer") {
-              paramSchema[field] = z.number().int();
-            } else if (prop.type === "string") {
-              paramSchema[field] = z.string();
-            }
-            // Add other types as needed
+      // Add all fields from the schema, marking required ones as required
+      if (referencedSchema.properties) {
+        Object.entries(referencedSchema.properties).forEach(([field, prop]) => {
+          if (prop) {
+            const zodSchema = resolveSchemaRef(prop.$ref, prop, schemas);
+            paramSchema[field] = referencedSchema.required?.includes(field)
+              ? zodSchema
+              : zodSchema.optional();
           }
         });
       }
@@ -116,9 +157,32 @@ export class MyMCP extends McpAgent {
     // Create the tool
     this.server.tool(toolName, paramSchema, async (params) => {
       try {
-        // Replace path parameters
+        // Pre-process special placeholders in params before validation
+        const processedParams = { ...params };
+        Object.entries(processedParams).forEach(([key, value]) => {
+          if (typeof value === "string") {
+            if (value === "{{$guid}}") {
+              processedParams[key] = crypto.randomUUID();
+            } else if (value === "{{$datetime iso8601}}") {
+              processedParams[key] = new Date().toISOString();
+            }
+          }
+        });
+
+        // Validate processed params against schema
+        const validatedParams = z.object(paramSchema).parse(processedParams);
+
+        // For Hawksoft endpoints, ensure we use the full integration path
         let finalPath = path;
-        Object.entries(params).forEach(([key, value]) => {
+        if (
+          !finalPath.startsWith("/integrations") &&
+          finalPath.includes("/hawksoft/")
+        ) {
+          finalPath = `/integrations${finalPath}`;
+        }
+
+        // Replace path parameters
+        Object.entries(validatedParams).forEach(([key, value]) => {
           if (path.includes(`{${key}}`)) {
             finalPath = finalPath.replace(
               `{${key}}`,
@@ -143,6 +207,11 @@ export class MyMCP extends McpAgent {
           }
         });
 
+        // Ensure X-Org-Id is set for Hawksoft endpoints
+        if (finalPath.includes("/hawksoft/")) {
+          headers["X-Org-Id"] = organizationId;
+        }
+
         const requestInit: RequestInit = {
           method: method.toUpperCase(),
           headers,
@@ -150,17 +219,23 @@ export class MyMCP extends McpAgent {
 
         // Add request body if needed
         if (operation.requestBody) {
-          // Remove parameters that were used in the path
-          const bodyParams = { ...params };
-          Object.keys(bodyParams).forEach((key) => {
-            if (path.includes(`{${key}}`)) {
-              delete bodyParams[key];
-            }
-          });
+          const bodyParams = { ...validatedParams };
+          // Transform ClientNumber to clientNumber for Hawksoft endpoints
+          if (bodyParams.ClientNumber !== undefined) {
+            bodyParams.clientNumber = bodyParams.ClientNumber;
+            delete bodyParams.ClientNumber;
+          }
           requestInit.body = JSON.stringify(bodyParams);
         }
 
-        console.log(`Making request to: ${baseUrl}${finalPath}`, requestInit);
+        console.log(`Making request to: ${baseUrl}${finalPath}`, {
+          method: requestInit.method,
+          headers: { ...headers },
+          body: requestInit.body
+            ? JSON.parse(requestInit.body as string)
+            : undefined,
+        });
+
         const res = await fetch(`${baseUrl}${finalPath}`, requestInit);
 
         const body = await res.text();
@@ -180,6 +255,23 @@ export class MyMCP extends McpAgent {
         try {
           // Try to parse as JSON if the response is JSON
           responseContent = JSON.parse(body);
+
+          // Format objects for better readability
+          if (typeof responseContent === "object") {
+            if (Array.isArray(responseContent)) {
+              // If it's an array, format each item
+              responseContent = responseContent
+                .map((item) =>
+                  typeof item === "object"
+                    ? JSON.stringify(item, null, 2)
+                    : item
+                )
+                .join("\n\n");
+            } else {
+              // If it's a single object, format it
+              responseContent = JSON.stringify(responseContent, null, 2);
+            }
+          }
         } catch {
           // If not JSON, use as plain text
           responseContent = body;
